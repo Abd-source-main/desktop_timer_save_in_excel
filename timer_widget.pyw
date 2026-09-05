@@ -12,9 +12,9 @@ Transparent desktop timer widget — circular button edition.
       DATE (full, YYYY-MM-DD) | Total Hours (decimal) | Total (H:MM) |
       Period 1 | Period 2 | ...
 
-Dates come from the timezone named in .env (TIMEZONE=Asia/Baghdad), not from
-the PC's own timezone, so the log stays correct even if Windows is set wrong.
-If the two disagree the widget warns you at start-up.
+Dates come from the TIMEZONE set below (Asia/Baghdad), not from the PC's own
+timezone, so the log stays correct even if Windows is set wrong. If the two
+disagree the widget warns you at start-up.
 
 Run with pythonw.exe so no console appears (use the Desktop shortcut).
 """
@@ -30,13 +30,11 @@ from openpyxl import Workbook, load_workbook
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCEL_PATH = os.path.join(SCRIPT_DIR, "time_log.xlsx")
-ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 
-# Used when .env is missing or has no timezone entry.
-DEFAULT_TIMEZONE = "Asia/Baghdad"
-# .env keys searched, in order, for the timezone name.
-TZ_KEYS = ("TIMEZONE", "TIME_ZONE", "TZ")
-# How far the PC's UTC offset may drift from the configured zone before we warn.
+# The zone periods are dated in. Change this one line to move timezone
+# (any IANA name, e.g. "Europe/London", "Asia/Dubai").
+TIMEZONE = "Asia/Baghdad"
+# How far the PC's UTC offset may drift from that zone before we warn.
 CLOCK_TOLERANCE_SECONDS = 60
 
 # Any pixel drawn in this exact colour becomes fully transparent (Windows).
@@ -92,53 +90,11 @@ def fmt_offset(delta):
 
 
 # ----------------------------------------------------------------------------
-# .env + timezone
+# Timezone
 # ----------------------------------------------------------------------------
-def load_env(path=None):
-    """Minimal .env reader: KEY=VALUE, # comments, optional quotes."""
-    path = ENV_PATH if path is None else path
-    data = {}
-    try:
-        with open(path, encoding="utf-8-sig") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return data
-
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("export "):
-            line = line[len("export "):].lstrip()
-        key, sep, value = line.partition("=")
-        if not sep:
-            continue
-        key = key.strip()
-        value = value.split(" #")[0].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key:
-            data[key] = value
-    return data
-
-
-def configured_timezone_name(env=None):
-    """Timezone name from .env, else the process environment, else the default."""
-    env = load_env() if env is None else env
-    for key in TZ_KEYS:
-        value = (env.get(key) or "").strip()
-        if value:
-            return value
-    for key in TZ_KEYS:
-        value = (os.environ.get(key) or "").strip()
-        if value:
-            return value
-    return DEFAULT_TIMEZONE
-
-
-def get_timezone(env=None):
+def get_timezone(name=None):
     """-> (name, tzinfo or None, error string or None)."""
-    name = configured_timezone_name(env)
+    name = name or TIMEZONE
     try:
         from zoneinfo import ZoneInfo
         return name, ZoneInfo(name), None
@@ -146,20 +102,20 @@ def get_timezone(env=None):
         return name, None, f"{type(exc).__name__}: {exc}"
 
 
-def now_local(env=None):
+def now_local(name=None):
     """Current time in the configured zone (falls back to the PC clock)."""
-    _, tz, _ = get_timezone(env)
+    _, tz, _ = get_timezone(name)
     if tz is None:
         return datetime.datetime.now()
     return datetime.datetime.now(tz)
 
 
-def clock_status(env=None, reference=None):
-    """Compare the PC's UTC offset with the .env timezone's offset.
+def clock_status(name=None, reference=None):
+    """Compare the PC's UTC offset with the configured timezone's offset.
 
     -> dict(ok, kind, timezone, expected, actual, delta_seconds, message)
     """
-    name, tz, err = get_timezone(env)
+    name, tz, err = get_timezone(name)
     ref = reference or datetime.datetime.now(datetime.timezone.utc)
 
     if tz is None:
@@ -171,9 +127,10 @@ def clock_status(env=None, reference=None):
             "actual": ref.astimezone().utcoffset(),
             "delta_seconds": None,
             "message": (
-                f"Timezone {name!r} from .env could not be loaded ({err}).\n\n"
+                f"Timezone {name!r} could not be loaded ({err}).\n\n"
                 "Times will be recorded using the PC clock instead.\n"
-                "Fix: run  pip install tzdata  , or correct TIMEZONE in .env."
+                "Fix: run  pip install tzdata  , or correct TIMEZONE at the "
+                "top of timer_widget.pyw."
             ),
         }
 
@@ -204,10 +161,10 @@ def clock_status(env=None, reference=None):
         "actual": actual,
         "delta_seconds": delta,
         "message": (
-            "This PC's clock does not match the timezone set in .env.\n\n"
-            f"  .env TIMEZONE : {name}  ({fmt_offset(expected)})\n"
-            f"  This PC       : {fmt_offset(actual)}\n"
-            f"  Difference    : {hours_off:+.2f} h\n\n"
+            "This PC's clock does not match the timezone this timer logs in.\n\n"
+            f"  TIMEZONE : {name}  ({fmt_offset(expected)})\n"
+            f"  This PC  : {fmt_offset(actual)}\n"
+            f"  Difference: {hours_off:+.2f} h\n\n"
             f"  {name} now : {ref.astimezone(tz):%Y-%m-%d %H:%M:%S}\n"
             f"  This PC now: {ref.astimezone():%Y-%m-%d %H:%M:%S}\n\n"
             f"Periods are logged using {name}, so the sheet stays correct — "
@@ -275,8 +232,7 @@ class TimerWidget:
         # Right-click context menu.
         self.save_var = tk.BooleanVar(value=True)
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(
-            label=f"Timezone: {configured_timezone_name()}", state="disabled")
+        self.menu.add_command(label=f"Timezone: {TIMEZONE}", state="disabled")
         self.menu.add_command(label="Check clock…", command=self.check_clock)
         self.menu.add_separator()
         self.menu.add_checkbutton(label="Save to Excel", variable=self.save_var)
