@@ -5,23 +5,39 @@ Transparent desktop timer widget — circular button edition.
 - HOVER the circle  -> shows the elapsed time next to it.
 - Quick CLICK        -> start / stop the timer (a "period").
 - PRESS & HOLD drag  -> move the circle anywhere on screen.
-- RIGHT-CLICK        -> menu: toggle "Save to Excel", or Exit.
+- RIGHT-CLICK        -> menu: toggle "Save to Excel", check the clock, or Exit.
 - Stopping (or exiting) records a period; if "Save to Excel" is on it is
-  written to time_log.xlsx, one row per date:
-      DATE | Total Hours (decimal) | Total (H:MM) | Period 1 | Period 2 | ...
+  written to time_log.xlsx, ONE SHEET PER MONTH ("1st", "2nd" ... "12th"),
+  one row per date inside that sheet:
+      DATE (full, YYYY-MM-DD) | Total Hours (decimal) | Total (H:MM) |
+      Period 1 | Period 2 | ...
+
+Dates come from the timezone named in .env (TIMEZONE=Asia/Baghdad), not from
+the PC's own timezone, so the log stays correct even if Windows is set wrong.
+If the two disagree the widget warns you at start-up.
 
 Run with pythonw.exe so no console appears (use the Desktop shortcut).
 """
 
 import os
+import re
 import time
 import datetime
 import tkinter as tk
+from tkinter import messagebox
 
 from openpyxl import Workbook, load_workbook
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCEL_PATH = os.path.join(SCRIPT_DIR, "time_log.xlsx")
+ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
+
+# Used when .env is missing or has no timezone entry.
+DEFAULT_TIMEZONE = "Asia/Baghdad"
+# .env keys searched, in order, for the timezone name.
+TZ_KEYS = ("TIMEZONE", "TIME_ZONE", "TZ")
+# How far the PC's UTC offset may drift from the configured zone before we warn.
+CLOCK_TOLERANCE_SECONDS = 60
 
 # Any pixel drawn in this exact colour becomes fully transparent (Windows).
 TRANSPARENT_KEY = "#010101"
@@ -42,7 +58,6 @@ COL_IDLE_HI = "#3a9a58"
 COL_RUN = "#b3402f"       # red
 COL_RUN_HI = "#cc4a37"
 
-
 # Sheet layout: A Date | B Total Hours | C Total (H:MM) | D.. periods
 HEADERS = ["Date", "Total Hours", "Total (H:MM)", "Periods ->"]
 HM_COL = 3
@@ -57,12 +72,153 @@ def fmt_duration(seconds):
 
 
 def fmt_hm(seconds):
-    """Hours + minutes, rounded to the nearest minute: 5400 -> "1:30"."""
-    minutes = int(round(seconds / 60.0))
+    """Hours + minutes, rounded to the nearest minute: 5400 -> "1:30".
+
+    Rounds half UP; round() would round 30s down to 0:00 (banker's rounding).
+    """
+    minutes = int((max(seconds, 0) + 30) // 60)
     h, m = divmod(minutes, 60)
     return f"{h}:{m:02d}"
 
 
+def fmt_offset(delta):
+    """A timedelta UTC offset as "UTC+03:00"."""
+    if delta is None:
+        return "UTC+??:??"
+    total = int(delta.total_seconds())
+    sign = "-" if total < 0 else "+"
+    h, m = divmod(abs(total) // 60, 60)
+    return f"UTC{sign}{h:02d}:{m:02d}"
+
+
+# ----------------------------------------------------------------------------
+# .env + timezone
+# ----------------------------------------------------------------------------
+def load_env(path=None):
+    """Minimal .env reader: KEY=VALUE, # comments, optional quotes."""
+    path = ENV_PATH if path is None else path
+    data = {}
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return data
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.split(" #")[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            data[key] = value
+    return data
+
+
+def configured_timezone_name(env=None):
+    """Timezone name from .env, else the process environment, else the default."""
+    env = load_env() if env is None else env
+    for key in TZ_KEYS:
+        value = (env.get(key) or "").strip()
+        if value:
+            return value
+    for key in TZ_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return DEFAULT_TIMEZONE
+
+
+def get_timezone(env=None):
+    """-> (name, tzinfo or None, error string or None)."""
+    name = configured_timezone_name(env)
+    try:
+        from zoneinfo import ZoneInfo
+        return name, ZoneInfo(name), None
+    except Exception as exc:            # unknown zone, or no tzdata installed
+        return name, None, f"{type(exc).__name__}: {exc}"
+
+
+def now_local(env=None):
+    """Current time in the configured zone (falls back to the PC clock)."""
+    _, tz, _ = get_timezone(env)
+    if tz is None:
+        return datetime.datetime.now()
+    return datetime.datetime.now(tz)
+
+
+def clock_status(env=None, reference=None):
+    """Compare the PC's UTC offset with the .env timezone's offset.
+
+    -> dict(ok, kind, timezone, expected, actual, delta_seconds, message)
+    """
+    name, tz, err = get_timezone(env)
+    ref = reference or datetime.datetime.now(datetime.timezone.utc)
+
+    if tz is None:
+        return {
+            "ok": False,
+            "kind": "timezone-unavailable",
+            "timezone": name,
+            "expected": None,
+            "actual": ref.astimezone().utcoffset(),
+            "delta_seconds": None,
+            "message": (
+                f"Timezone {name!r} from .env could not be loaded ({err}).\n\n"
+                "Times will be recorded using the PC clock instead.\n"
+                "Fix: run  pip install tzdata  , or correct TIMEZONE in .env."
+            ),
+        }
+
+    expected = ref.astimezone(tz).utcoffset()
+    actual = ref.astimezone().utcoffset()
+    delta = (actual - expected).total_seconds()
+
+    if abs(delta) <= CLOCK_TOLERANCE_SECONDS:
+        return {
+            "ok": True,
+            "kind": "in-sync",
+            "timezone": name,
+            "expected": expected,
+            "actual": actual,
+            "delta_seconds": delta,
+            "message": (
+                f"Clock is in sync with {name} ({fmt_offset(expected)}).\n"
+                f"Local time there: {ref.astimezone(tz):%Y-%m-%d %H:%M:%S}"
+            ),
+        }
+
+    hours_off = delta / 3600.0
+    return {
+        "ok": False,
+        "kind": "offset-mismatch",
+        "timezone": name,
+        "expected": expected,
+        "actual": actual,
+        "delta_seconds": delta,
+        "message": (
+            "This PC's clock does not match the timezone set in .env.\n\n"
+            f"  .env TIMEZONE : {name}  ({fmt_offset(expected)})\n"
+            f"  This PC       : {fmt_offset(actual)}\n"
+            f"  Difference    : {hours_off:+.2f} h\n\n"
+            f"  {name} now : {ref.astimezone(tz):%Y-%m-%d %H:%M:%S}\n"
+            f"  This PC now: {ref.astimezone():%Y-%m-%d %H:%M:%S}\n\n"
+            f"Periods are logged using {name}, so the sheet stays correct — "
+            "but fix the Windows clock/timezone if this is unexpected."
+        ),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Widget
+# ----------------------------------------------------------------------------
 class TimerWidget:
     def __init__(self):
         self.running = False
@@ -119,6 +275,10 @@ class TimerWidget:
         # Right-click context menu.
         self.save_var = tk.BooleanVar(value=True)
         self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(
+            label=f"Timezone: {configured_timezone_name()}", state="disabled")
+        self.menu.add_command(label="Check clock…", command=self.check_clock)
+        self.menu.add_separator()
         self.menu.add_checkbutton(label="Save to Excel", variable=self.save_var)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.on_close)
@@ -128,6 +288,9 @@ class TimerWidget:
         self.root.update_idletasks()
         self.place_bottom_right()
         self.tick()
+        # Warn once the event loop is running, so the dialog is not modal
+        # against a half-built window.
+        self.root.after(600, self.warn_if_clock_out_of_sync)
 
     # ------------------------------------------------------------- placement
     def place_bottom_right(self):
@@ -184,6 +347,21 @@ class TimerWidget:
         finally:
             self.menu.grab_release()
 
+    # ------------------------------------------------------------- clock
+    def warn_if_clock_out_of_sync(self):
+        status = clock_status()
+        if not status["ok"]:
+            messagebox.showwarning(
+                "Clock / timezone mismatch", status["message"], parent=self.root)
+
+    def check_clock(self):
+        status = clock_status()
+        if status["ok"]:
+            messagebox.showinfo("Clock", status["message"], parent=self.root)
+        else:
+            messagebox.showwarning(
+                "Clock / timezone mismatch", status["message"], parent=self.root)
+
     # ------------------------------------------------------------- timer
     def toggle(self):
         self.stop() if self.running else self.start()
@@ -207,7 +385,15 @@ class TimerWidget:
             try:
                 save_period(self.elapsed)
             except Exception as exc:
-                print("Failed to save:", exc)
+                # Never fail silently: under pythonw there is no console, so a
+                # print() here would be lost (and would itself raise).
+                messagebox.showerror(
+                    "Could not save period",
+                    f"{fmt_duration(self.elapsed)} was NOT written to\n"
+                    f"{EXCEL_PATH}\n\n{type(exc).__name__}: {exc}\n\n"
+                    "Close the file in Excel and try again.",
+                    parent=self.root,
+                )
 
         self.elapsed = 0.0
         if self._hover:
@@ -231,8 +417,63 @@ class TimerWidget:
 
 
 # ----------------------------------------------------------------------------
-# Excel writing
+# Excel writing — one sheet per month
 # ----------------------------------------------------------------------------
+def ordinal(n):
+    """1 -> "1st", 2 -> "2nd", 11 -> "11th"."""
+    if 11 <= n % 100 <= 13:
+        return f"{n}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def month_sheet_name(month):
+    """Sheet title for a month number: 4 -> "4th"."""
+    return ordinal(month)
+
+
+def month_from_sheet_name(title):
+    """Month number for a sheet title, or None if it is not a month sheet."""
+    if not isinstance(title, str):
+        return None
+    text = title.strip().lower()
+    if not re.fullmatch(r"\d{1,2}(st|nd|rd|th)", text):
+        return None
+    number = int(re.match(r"\d{1,2}", text).group(0))
+    if 1 <= number <= 12 and month_sheet_name(number) == text:
+        return number
+    return None
+
+
+def parse_date(value):
+    """Excel cells may hand back a str or a datetime; normalise to a date."""
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def parse_duration(value):
+    """A period cell back into seconds: "01:30:00" -> 5400.0. None if unreadable."""
+    if isinstance(value, datetime.timedelta):
+        return value.total_seconds()
+    if isinstance(value, datetime.time):
+        return value.hour * 3600 + value.minute * 60 + value.second
+    if value in (None, ""):
+        return None
+    match = re.fullmatch(r"(\d+):([0-5]?\d):([0-5]?\d)", str(value).strip())
+    if not match:
+        return None
+    h, m, s = (int(g) for g in match.groups())
+    return float(h * 3600 + m * 60 + s)
+
+
 def ensure_hm_column(ws):
     """Upgrade a sheet written before the H:MM column existed."""
     if ws.cell(row=1, column=HM_COL).value == HEADERS[HM_COL - 1]:
@@ -246,49 +487,123 @@ def ensure_hm_column(ws):
         ws.cell(row=row, column=HM_COL, value=fmt_hm(float(total) * 3600.0))
 
 
-def save_period(seconds):
-    """Append a period to today's row in time_log.xlsx.
+def get_month_sheet(wb, month):
+    """The sheet for a month, created (in calendar order) if missing."""
+    name = month_sheet_name(month)
+    if name in wb.sheetnames:
+        ws = wb[name]
+        ensure_hm_column(ws)
+        return ws
 
-    Layout, one row per date:
-        A: Date | B: Total Hours | C: Total (H:MM) | D: Period 1 | E: Period 2 | ...
+    position = 0
+    for title in wb.sheetnames:
+        other = month_from_sheet_name(title)
+        if other is not None and other < month:
+            position += 1
+    ws = wb.create_sheet(title=name, index=position)
+    ws.append(HEADERS)
+    return ws
+
+
+def find_date_row(ws, day):
+    for row in range(2, ws.max_row + 1):
+        if parse_date(ws.cell(row=row, column=1).value) == day:
+            return row
+    return None
+
+
+def upsert_day(ws, day, hours, periods):
+    """Add hours + period cells to `day`'s row, creating the row if needed."""
+    target_row = find_date_row(ws, day)
+    if target_row is None:
+        target_row = ws.max_row + 1
+        ws.cell(row=target_row, column=1, value=day.isoformat())
+        previous_hours = 0.0
+    else:
+        previous_hours = float(ws.cell(row=target_row, column=2).value or 0)
+
+    col = PERIOD_COL
+    while ws.cell(row=target_row, column=col).value not in (None, ""):
+        col += 1
+    for period in periods:
+        ws.cell(row=target_row, column=col, value=period)
+        col += 1
+
+    # Re-total from the period cells. They hold whole seconds, so the sum is
+    # exact; carrying forward the ROUNDED total in column B instead would drift
+    # by a second or two more with every period added to the day.
+    total_seconds = 0.0
+    exact = False
+    for period_col in range(PERIOD_COL, col):
+        seconds = parse_duration(ws.cell(row=target_row, column=period_col).value)
+        if seconds is None:          # hand-edited cell we cannot read
+            exact = False
+            break
+        total_seconds += seconds
+        exact = True
+    if not exact:                    # fall back to the running total
+        total_seconds = (previous_hours + hours) * 3600.0
+
+    ws.cell(row=target_row, column=2, value=round(total_seconds / 3600.0, 3))
+    ws.cell(row=target_row, column=HM_COL, value=fmt_hm(total_seconds))
+    return target_row
+
+
+def looks_like_log_sheet(ws):
+    return ws.cell(row=1, column=1).value == HEADERS[0]
+
+
+def migrate_legacy_sheets(wb):
+    """Split a pre-monthly single-sheet log into per-month sheets.
+
+    Sheets that are not ours are left untouched.
     """
-    today = datetime.date.today().isoformat()
+    for title in list(wb.sheetnames):
+        if month_from_sheet_name(title) is not None:
+            continue
+        ws = wb[title]
+        if not looks_like_log_sheet(ws):
+            continue
+
+        ensure_hm_column(ws)
+        rows = []
+        for values in ws.iter_rows(min_row=2, values_only=True):
+            day = parse_date(values[0] if values else None)
+            if day is None:
+                continue
+            raw_hours = values[1] if len(values) > 1 else 0
+            try:
+                hours = float(raw_hours or 0)
+            except (TypeError, ValueError):
+                hours = 0.0
+            periods = [v for v in values[PERIOD_COL - 1:] if v not in (None, "")]
+            rows.append((day, hours, periods))
+
+        wb.remove(ws)
+        for day, hours, periods in rows:
+            upsert_day(get_month_sheet(wb, day.month), day, hours, periods)
+
+
+def save_period(seconds, when=None):
+    """Append a period to today's row, in this month's sheet.
+
+    Workbook layout:
+        sheet "1st".."12th"  — one per month
+        A: Date (YYYY-MM-DD) | B: Total Hours | C: Total (H:MM) | D..: Periods
+    """
+    when = now_local() if when is None else when
+    day = when.date() if isinstance(when, datetime.datetime) else when
     hours = seconds / 3600.0
-    period_str = fmt_duration(seconds)
 
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
-        ws = wb.active
-        ensure_hm_column(ws)
+        migrate_legacy_sheets(wb)
     else:
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Time Log"
-        ws.append(HEADERS)
+        wb.remove(wb.active)        # drop the default empty "Sheet"
 
-    target_row = None
-    for row in range(2, ws.max_row + 1):
-        cell = ws.cell(row=row, column=1).value
-        if cell is not None and str(cell) == today:
-            target_row = row
-            break
-
-    if target_row is None:
-        target_row = ws.max_row + 1
-        total_hours = hours
-        ws.cell(row=target_row, column=1, value=today)
-        ws.cell(row=target_row, column=PERIOD_COL, value=period_str)
-    else:
-        prev_total = ws.cell(row=target_row, column=2).value or 0
-        total_hours = float(prev_total) + hours
-        col = PERIOD_COL
-        while ws.cell(row=target_row, column=col).value not in (None, ""):
-            col += 1
-        ws.cell(row=target_row, column=col, value=period_str)
-
-    ws.cell(row=target_row, column=2, value=round(total_hours, 3))
-    ws.cell(row=target_row, column=HM_COL, value=fmt_hm(total_hours * 3600.0))
-
+    ws = get_month_sheet(wb, day.month)
+    upsert_day(ws, day, hours, [fmt_duration(seconds)])
     wb.save(EXCEL_PATH)
 
 
