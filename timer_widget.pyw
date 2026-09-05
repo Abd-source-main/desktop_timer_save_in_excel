@@ -8,7 +8,7 @@ Transparent desktop timer widget — circular button edition.
 - RIGHT-CLICK        -> menu: toggle "Save to Excel", or Exit.
 - Stopping (or exiting) records a period; if "Save to Excel" is on it is
   written to time_log.xlsx, one row per date:
-      DATE | Total Hours (sum of that day's periods) | Period 1 | Period 2 | ...
+      DATE | Total Hours (decimal) | Total (H:MM) | Period 1 | Period 2 | ...
 
 Run with pythonw.exe so no console appears (use the Desktop shortcut).
 """
@@ -43,11 +43,24 @@ COL_RUN = "#b3402f"       # red
 COL_RUN_HI = "#cc4a37"
 
 
+# Sheet layout: A Date | B Total Hours | C Total (H:MM) | D.. periods
+HEADERS = ["Date", "Total Hours", "Total (H:MM)", "Periods ->"]
+HM_COL = 3
+PERIOD_COL = 4
+
+
 def fmt_duration(seconds):
     seconds = int(round(seconds))
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def fmt_hm(seconds):
+    """Hours + minutes, rounded to the nearest minute: 5400 -> "1:30"."""
+    minutes = int(round(seconds / 60.0))
+    h, m = divmod(minutes, 60)
+    return f"{h}:{m:02d}"
 
 
 class TimerWidget:
@@ -220,11 +233,24 @@ class TimerWidget:
 # ----------------------------------------------------------------------------
 # Excel writing
 # ----------------------------------------------------------------------------
+def ensure_hm_column(ws):
+    """Upgrade a sheet written before the H:MM column existed."""
+    if ws.cell(row=1, column=HM_COL).value == HEADERS[HM_COL - 1]:
+        return
+    ws.insert_cols(HM_COL)
+    ws.cell(row=1, column=HM_COL, value=HEADERS[HM_COL - 1])
+    for row in range(2, ws.max_row + 1):
+        if ws.cell(row=row, column=1).value in (None, ""):
+            continue
+        total = ws.cell(row=row, column=2).value or 0
+        ws.cell(row=row, column=HM_COL, value=fmt_hm(float(total) * 3600.0))
+
+
 def save_period(seconds):
     """Append a period to today's row in time_log.xlsx.
 
     Layout, one row per date:
-        A: Date | B: Total Hours | C: Period 1 | D: Period 2 | ...
+        A: Date | B: Total Hours | C: Total (H:MM) | D: Period 1 | E: Period 2 | ...
     """
     today = datetime.date.today().isoformat()
     hours = seconds / 3600.0
@@ -233,11 +259,12 @@ def save_period(seconds):
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
         ws = wb.active
+        ensure_hm_column(ws)
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = "Time Log"
-        ws.append(["Date", "Total Hours", "Periods ->"])
+        ws.append(HEADERS)
 
     target_row = None
     for row in range(2, ws.max_row + 1):
@@ -248,16 +275,19 @@ def save_period(seconds):
 
     if target_row is None:
         target_row = ws.max_row + 1
+        total_hours = hours
         ws.cell(row=target_row, column=1, value=today)
-        ws.cell(row=target_row, column=2, value=round(hours, 3))
-        ws.cell(row=target_row, column=3, value=period_str)
+        ws.cell(row=target_row, column=PERIOD_COL, value=period_str)
     else:
         prev_total = ws.cell(row=target_row, column=2).value or 0
-        ws.cell(row=target_row, column=2, value=round(float(prev_total) + hours, 3))
-        col = 3
+        total_hours = float(prev_total) + hours
+        col = PERIOD_COL
         while ws.cell(row=target_row, column=col).value not in (None, ""):
             col += 1
         ws.cell(row=target_row, column=col, value=period_str)
+
+    ws.cell(row=target_row, column=2, value=round(total_hours, 3))
+    ws.cell(row=target_row, column=HM_COL, value=fmt_hm(total_hours * 3600.0))
 
     wb.save(EXCEL_PATH)
 
