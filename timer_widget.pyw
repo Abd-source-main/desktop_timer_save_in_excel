@@ -7,8 +7,8 @@ Transparent desktop timer widget — circular button edition.
 - PRESS & HOLD drag  -> move the circle anywhere on screen.
 - RIGHT-CLICK        -> menu: toggle "Save to Excel", check the clock, or Exit.
 - Stopping (or exiting) records a period; if "Save to Excel" is on it is
-  written to time_log.xlsx, ONE SHEET PER MONTH ("1st", "2nd" ... "12th"),
-  one row per date inside that sheet:
+  written to time_log.xlsx, ONE SHEET PER MONTH named year-then-month
+  ("2026-1st", "2026-2nd" ... "2026-12th"), one row per date inside it:
       DATE (full, YYYY-MM-DD) | Total Hours (decimal) | Total (H:MM) |
       Period 1 | Period 2 | ...
 
@@ -383,22 +383,26 @@ def ordinal(n):
     return f"{n}{suffix}"
 
 
-def month_sheet_name(month):
-    """Sheet title for a month number: 4 -> "4th"."""
-    return ordinal(month)
+def sheet_name(day):
+    """Sheet title for a date: 2026-05-04 -> "2026-5th"."""
+    return f"{day.year}-{ordinal(day.month)}"
 
 
-def month_from_sheet_name(title):
-    """Month number for a sheet title, or None if it is not a month sheet."""
+def parse_sheet_name(title):
+    """(year, month) for a sheet title, or None if it is not one of ours."""
     if not isinstance(title, str):
         return None
     text = title.strip().lower()
-    if not re.fullmatch(r"\d{1,2}(st|nd|rd|th)", text):
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})(?:st|nd|rd|th)", text)
+    if not match:
         return None
-    number = int(re.match(r"\d{1,2}", text).group(0))
-    if 1 <= number <= 12 and month_sheet_name(number) == text:
-        return number
-    return None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    # Reject a wrong suffix ("2026-1th") rather than silently accepting it.
+    if f"{year}-{ordinal(month)}" != text:
+        return None
+    return year, month
 
 
 def parse_date(value):
@@ -443,18 +447,19 @@ def ensure_hm_column(ws):
         ws.cell(row=row, column=HM_COL, value=fmt_hm(float(total) * 3600.0))
 
 
-def get_month_sheet(wb, month):
-    """The sheet for a month, created (in calendar order) if missing."""
-    name = month_sheet_name(month)
+def get_sheet(wb, day):
+    """The sheet for a date's month, created (in calendar order) if missing."""
+    name = sheet_name(day)
     if name in wb.sheetnames:
         ws = wb[name]
         ensure_hm_column(ws)
         return ws
 
+    key = (day.year, day.month)
     position = 0
     for title in wb.sheetnames:
-        other = month_from_sheet_name(title)
-        if other is not None and other < month:
+        other = parse_sheet_name(title)
+        if other is not None and other < key:
             position += 1
     ws = wb.create_sheet(title=name, index=position)
     ws.append(HEADERS)
@@ -510,12 +515,14 @@ def looks_like_log_sheet(ws):
 
 
 def migrate_legacy_sheets(wb):
-    """Split a pre-monthly single-sheet log into per-month sheets.
+    """Re-file rows from older sheet layouts into "<year>-<month>" sheets.
 
+    Handles both the original single "Time Log" sheet and the year-less
+    month sheets ("5th"), splitting the latter by each row's own year.
     Sheets that are not ours are left untouched.
     """
     for title in list(wb.sheetnames):
-        if month_from_sheet_name(title) is not None:
+        if parse_sheet_name(title) is not None:
             continue
         ws = wb[title]
         if not looks_like_log_sheet(ws):
@@ -537,14 +544,14 @@ def migrate_legacy_sheets(wb):
 
         wb.remove(ws)
         for day, hours, periods in rows:
-            upsert_day(get_month_sheet(wb, day.month), day, hours, periods)
+            upsert_day(get_sheet(wb, day), day, hours, periods)
 
 
 def save_period(seconds, when=None):
     """Append a period to today's row, in this month's sheet.
 
     Workbook layout:
-        sheet "1st".."12th"  — one per month
+        sheet "2026-1st".."2026-12th"  — one per month of each year
         A: Date (YYYY-MM-DD) | B: Total Hours | C: Total (H:MM) | D..: Periods
     """
     when = now_local() if when is None else when
@@ -558,7 +565,7 @@ def save_period(seconds, when=None):
         wb = Workbook()
         wb.remove(wb.active)        # drop the default empty "Sheet"
 
-    ws = get_month_sheet(wb, day.month)
+    ws = get_sheet(wb, day)
     upsert_day(ws, day, hours, [fmt_duration(seconds)])
     wb.save(EXCEL_PATH)
 
